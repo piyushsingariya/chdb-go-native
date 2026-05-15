@@ -5,6 +5,7 @@ go 1.25
 require github.com/ClickHouse/clickhouse-go/v2 v2.43.0
 
 require (
+	github.com/AfterShip/clickhouse-sql-parser v0.4.16 // indirect
 	github.com/ebitengine/purego v0.8.4 // indirect
 	github.com/huandu/go-clone v1.7.3 // indirect
 	github.com/huandu/xstrings v1.4.0 // indirect

@@ -1,0 +1,229 @@
+# Distributed Table Interception
+
+## Context
+
+ChDB (in-process ClickHouse) does not support the `Distributed` engine. When callers execute `CREATE TABLE ... ENGINE = Distributed(...)`, chdb would fail. The fix:
+- Intercept `CREATE TABLE ... ENGINE = Distributed(...)` in `Exec()`, record the distributed→local mapping, skip execution.
+- On all subsequent queries (SELECT, INSERT, DML), rewrite references to distributed table names into their local equivalents using AST-level replacement via the AfterShip SQL parser.
+
+---
+
+## Files Changed
+
+| File | Action |
+|---|---|
+| `distributed.go` | NEW — CREATE TABLE detection + AST-based query rewrite |
+| `connection.go` | MODIFY — extend `chdbConn`, intercept `Exec`, rewrite in `Select`/`Query` |
+| `go.mod` / `go.sum` | MODIFY — add `github.com/AfterShip/clickhouse-sql-parser@v0.4.16` |
+
+---
+
+## Step 1 — Add Dependency
+
+```
+go get github.com/AfterShip/clickhouse-sql-parser@v0.4.16
+```
+
+---
+
+## Step 2 — Create `distributed.go`
+
+Package `gockhouse`. Imports: `strings`, `github.com/AfterShip/clickhouse-sql-parser/parser`.
+
+### `unquoteIdent(s string) string`
+
+Strips one layer of backtick/single-quote/double-quote wrapping. Safety net for `StringLiteral` args in Distributed engine params.
+
+### `detectDistributed(query string) (distName, localName string, isQualified bool, ok bool)`
+
+Parses with `parser.NewParser(query).ParseStmts()`. Returns `ok=false` at the first failure.
+
+```
+1. Parse; return ok=false on error or empty result.
+2. Type-assert stmts[0] as *parser.CreateTable; else ok=false.
+3. Check ct.Engine != nil && strings.EqualFold(ct.Engine.Name, "Distributed"); else ok=false.
+4. Check ct.Engine.Params != nil && .Items != nil && len(.Items.Items) >= 3; else ok=false.
+5. Extract distName from ct.Name:
+     distTableName = ct.Name.Table.Name
+     isQualified   = ct.Name.Database != nil
+     if isQualified: distName = ct.Name.Database.Name + "." + distTableName
+     else:           distName = distTableName
+6. Extract localTableArg from Params.Items.Items[2]:
+     type-switch on *parser.Ident (.Name) or *parser.StringLiteral (.Literal)
+     apply unquoteIdent as safety net; default → ok=false
+7. Extract localDB from Params.Items.Items[1] (same type-switch + unquoteIdent).
+8. Build localName:
+     if isQualified && localDB != "": localName = localDB + "." + rawLocalName
+     else:                            localName = rawLocalName
+9. return distName, localName, isQualified, true
+```
+
+### `rewriteQueryAST(query string, distByKey map[string]string) string`
+
+Parser-based rewrite. Returns the rewritten query, or the original unchanged if the parser cannot parse it.
+
+```
+1. p := parser.NewParser(query); stmts, err := p.ParseStmts()
+   if err != nil || len(stmts) == 0 { return query }
+
+2. modified := false
+   For each stmt in stmts:
+     parser.Walk(stmt, func(node parser.Expr) bool {
+         ti, ok := node.(*parser.TableIdentifier)
+         if !ok { return true }
+
+         // Build lowercase lookup key
+         tablePart := strings.ToLower(ti.Table.Name)
+         var key string
+         if ti.Database != nil {
+             key = strings.ToLower(ti.Database.Name) + "." + tablePart
+         } else {
+             key = tablePart
+         }
+
+         localName, found := distByKey[key]
+         if !found { return true }
+
+         // Mutate in place; QuoteType is preserved so Ident.String() keeps original quoting
+         if idx := strings.Index(localName, "."); idx >= 0 {
+             if ti.Database != nil { ti.Database.Name = localName[:idx] }
+             ti.Table.Name = localName[idx+1:]
+         } else {
+             ti.Table.Name = localName
+         }
+         modified = true
+         return true
+     })
+
+3. if !modified { return query }
+
+4. Collect stmt.String() for each stmt, join with ";\n", return.
+```
+
+**Why in-place mutation works**: `Walk` passes `*TableIdentifier` pointers. Mutating `ti.Table.Name` directly modifies the AST that `stmt.String()` reads. `Ident.String()` uses `QuoteType` to re-add quotes, which we leave untouched — so original quoting round-trips correctly.
+
+**Why `Transform` is NOT used**: The parser's `Transform` only calls the transformer on the root and does a no-op `Walk`; it does not recurse into children.
+
+---
+
+## Step 3 — Extend `chdbConn` in `connection.go`
+
+```go
+type chdbConn struct {
+    session   *chdb.Session
+    mu        sync.RWMutex
+    distByKey map[string]string  // lowercase "db.table" or "table" → localName
+}
+```
+
+Update `Open()` to initialise `distByKey`:
+
+```go
+return &chdbConn{session: session, distByKey: make(map[string]string)}, nil
+```
+
+### `recordDistributed(distName, localName string)`
+
+```go
+func (c *chdbConn) recordDistributed(distName, localName string) {
+    key := strings.ToLower(distName)
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    c.distByKey[key] = localName
+}
+```
+
+### `rewriteDistributedTables(query string) string`
+
+```go
+func (c *chdbConn) rewriteDistributedTables(query string) string {
+    c.mu.RLock()
+    defer c.mu.RUnlock()
+    if len(c.distByKey) == 0 {
+        return query
+    }
+    return rewriteQueryAST(query, c.distByKey)
+}
+```
+
+---
+
+## Step 4 — Modify `Exec()` in `connection.go`
+
+```go
+func (c *chdbConn) Exec(_ context.Context, query string, args ...any) error {
+    query = rewriteClusterAllReplicas(query)
+
+    if distName, localName, _, ok := detectDistributed(query); ok {
+        c.recordDistributed(distName, localName)
+        return nil  // skip: chdb cannot handle Distributed engine
+    }
+
+    query = c.rewriteDistributedTables(query)
+    compiled, err := interpolateArgs(query, args)
+    if err != nil {
+        return fmt.Errorf("chdbConn: Exec: interpolate args: %w", err)
+    }
+    result, err := c.session.Query(compiled, "CSV")
+    if err != nil {
+        return fmt.Errorf("chdbConn: Exec: %w", err)
+    }
+    defer result.Free()
+    return result.Error()
+}
+```
+
+---
+
+## Step 5 — Modify `Select()` and `Query()` in `connection.go`
+
+Insert `rewriteDistributedTables` after `rewriteClusterAllReplicas`:
+
+```go
+// Select():
+query = rewriteClusterAllReplicas(query)
+query = c.rewriteDistributedTables(query)  // added
+
+// Query():
+query = rewriteClusterAllReplicas(query)
+query = c.rewriteDistributedTables(query)  // added
+```
+
+---
+
+## Rewrite Pipeline (all query methods)
+
+```
+original query
+  → rewriteClusterAllReplicas(query)
+  → c.rewriteDistributedTables(query)      parser AST rewrite; original returned if parse fails
+  → interpolateArgs(query, args)
+  → c.session.Query(compiled, format)
+```
+
+---
+
+## Thread Safety
+
+| Op | Lock |
+|---|---|
+| `recordDistributed` (write `distByKey`) | `mu.Lock()` |
+| `rewriteDistributedTables` (read `distByKey`) | `mu.RLock()` |
+| `detectDistributed`, `rewriteQueryAST` | none — pure functions |
+
+---
+
+## Edge Cases
+
+| Scenario | Handled |
+|---|---|
+| Parse error on CREATE TABLE | `detectDistributed` returns `ok=false`; proceeds normally |
+| Non-CREATE-TABLE statement | type assertion failure → `ok=false` |
+| No ENGINE clause on CreateTable | nil check |
+| Engine is not Distributed | `EqualFold` check |
+| Fewer than 3 engine params | length check |
+| Local table arg is function/other expr | default type-switch → `ok=false` |
+| Empty db qualifier in engine params | `isQual && localDB != ""` guard |
+| Parser can't parse query in rewrite | `rewriteQueryAST` returns original unchanged |
+| No distributed tables registered | fast-path early return |
+| Concurrent `Exec` (write) + `Select` (read) | `sync.RWMutex` |

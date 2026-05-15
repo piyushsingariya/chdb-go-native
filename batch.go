@@ -33,7 +33,7 @@ func newBatch(ctx context.Context, conn *chdbConn, query string) (*chdbBatch, er
 	if m == nil {
 		return nil, fmt.Errorf("chdbBatch: cannot parse INSERT query: %q", query)
 	}
-	table := m[1]
+	table := conn.rewriter.ResolveTable(m[1])
 
 	var cols []string
 	if m[2] != "" {

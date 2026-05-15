@@ -3,13 +3,10 @@ package gockhouse
 import (
 	"context"
 	"fmt"
-	"regexp"
-	"strings"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	chdb "github.com/chdb-io/chdb-go/chdb"
-	"github.com/huandu/go-sqlbuilder"
 	"github.com/piyushsingariya/gockhouse/internal"
 )
 
@@ -26,40 +23,20 @@ func Open(dir string) (clickhouse.Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("gockhouse: open session: %w", err)
 	}
-	return &chdbConn{session: session}, nil
-}
-
-// clusterAllReplicasRe matches clusterAllReplicas('<cluster>', <table>) and captures
-// the table expression so we can rewrite it for chdb's single-node context.
-var clusterAllReplicasRe = regexp.MustCompile(`(?i)clusterAllReplicas\('[^']*',\s*([^)]+)\)`)
-
-// rewriteClusterAllReplicas strips the clusterAllReplicas wrapper from a query,
-// replacing it with a direct table reference. This lets single-node chdb sessions
-// execute queries originally written for a multi-node ClickHouse cluster.
-func rewriteClusterAllReplicas(query string) string {
-	return clusterAllReplicasRe.ReplaceAllStringFunc(query, func(match string) string {
-		sub := clusterAllReplicasRe.FindStringSubmatch(match)
-		if len(sub) < 2 {
-			return match
-		}
-		return strings.TrimSpace(sub[1])
-	})
-}
-
-// interpolateArgs substitutes ? placeholders in query using the ClickHouse SQL flavor
-// from go-sqlbuilder — the same mechanism used by chdb's own database/sql driver.
-func interpolateArgs(query string, args []any) (string, error) {
-	if len(args) == 0 {
-		return query, nil
-	}
-	return sqlbuilder.ClickHouse.Interpolate(query, args)
+	return &chdbConn{
+		session: session,
+		rewriter: NewQueryRewriter(),
+		args:     NewArgsHandler(),
+	}, nil
 }
 
 // chdbConn wraps a chdb Session and exposes it as a clickhouse.Conn.
 // Exec, Select, Query, and QueryRow execute queries for real via chdb.
 // The remaining interface methods are lightweight stubs sufficient for testing.
 type chdbConn struct {
-	session *chdb.Session
+	session  *chdb.Session
+	rewriter *QueryRewriter
+	args     *ArgsHandler
 }
 
 var _ clickhouse.Conn = (*chdbConn)(nil)
@@ -88,12 +65,16 @@ func (c *chdbConn) PrepareBatch(ctx context.Context, query string, _ ...driver.P
 }
 
 // Exec executes a DDL or DML statement (CREATE TABLE, INSERT, DROP, …) via chdb.
-// Any result set is discarded; only errors are surfaced.
+// CREATE TABLE ... ENGINE = Distributed(...) is intercepted: the distributed→local
+// mapping is recorded and execution is skipped (chdb does not support Distributed).
 func (c *chdbConn) Exec(_ context.Context, query string, args ...any) error {
-	query = rewriteClusterAllReplicas(query)
-	compiled, err := interpolateArgs(query, args)
+	query, skip := c.rewriter.ProcessQuery(query)
+	if skip {
+		return nil
+	}
+	compiled, err := c.args.ProcessArgs(query, args)
 	if err != nil {
-		return fmt.Errorf("chdbConn: Exec: interpolate args: %w", err)
+		return fmt.Errorf("chdbConn: Exec: %w", err)
 	}
 	result, err := c.session.Query(compiled, "CSV")
 	if err != nil {
@@ -111,10 +92,10 @@ func (c *chdbConn) Exec(_ context.Context, query string, args ...any) error {
 //  2. `json:"<column>"` struct tag
 //  3. Lowercased field name
 func (c *chdbConn) Select(_ context.Context, dest any, query string, args ...any) error {
-	query = rewriteClusterAllReplicas(query)
-	compiled, err := interpolateArgs(query, args)
+	query, _ = c.rewriter.ProcessQuery(query)
+	compiled, err := c.args.ProcessArgs(query, args)
 	if err != nil {
-		return fmt.Errorf("chdbConn: Select: interpolate args: %w", err)
+		return fmt.Errorf("chdbConn: Select: %w", err)
 	}
 	result, err := c.session.Query(compiled, "JSONCompact")
 	if err != nil {
@@ -129,10 +110,10 @@ func (c *chdbConn) Select(_ context.Context, dest any, query string, args ...any
 
 // Query executes query and returns a Rows iterator.
 func (c *chdbConn) Query(_ context.Context, query string, args ...any) (driver.Rows, error) {
-	query = rewriteClusterAllReplicas(query)
-	compiled, err := interpolateArgs(query, args)
+	query, _ = c.rewriter.ProcessQuery(query)
+	compiled, err := c.args.ProcessArgs(query, args)
 	if err != nil {
-		return nil, fmt.Errorf("chdbConn: Query: interpolate args: %w", err)
+		return nil, fmt.Errorf("chdbConn: Query: %w", err)
 	}
 	result, err := c.session.Query(compiled, "JSONCompact")
 	if err != nil {
